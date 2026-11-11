@@ -1,0 +1,88 @@
+#!/bin/bash
+# arc-vfio-resize: enlarge BAR2 of Intel Arc GPUs that are bound to
+# vfio-pci (or no driver), using the kernel's resource2_resize attribute.
+# Needs the test kernel booted with pci_arc_release_bar0. Run as root
+# while the VMs using these GPUs are stopped.
+#
+# Usage: arc-vfio-resize [--dry-run] [--max-gib N] [--with-audio] [BDF...]
+#   no BDF        all Intel GPUs bound to vfio-pci or unbound
+#   --max-gib N   cap the size, e.g. when the 64-bit window is too small
+#   --with-audio  remove the card's audio function(s) before resizing and
+#                 rescan afterwards (if a resize fails because of them)
+
+set -u
+SYS=${SYS:-/sys/bus/pci/devices}
+DRY=0; MAX_GIB=0; AUDIO=0; DEVS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --max-gib) shift; MAX_GIB=${1:?--max-gib needs a value} ;;
+    --with-audio) AUDIO=1 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    *) DEVS+=("$1") ;;
+  esac
+  shift
+done
+[ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
+grep -qE '(^| )pci_arc_release_bar0(=(1|y|Y|yes|on|true))?( |$)' /proc/cmdline ||
+  echo "warning: pci_arc_release_bar0 is not on the kernel cmdline; the resize will most likely fail"
+
+drv_of() { [ -L "$SYS/$1/driver" ] && basename "$(readlink -f "$SYS/$1/driver")"; }
+
+if [ ${#DEVS[@]} -eq 0 ]; then
+  for d in "$SYS"/*; do
+    dev=${d##*/}
+    [ "$(cat "$d/vendor")" = 0x8086 ] || continue
+    case "$(cat "$d/class")" in 0x03*) ;; *) continue ;; esac
+    case "$(drv_of "$dev")" in vfio-pci|"") DEVS+=("$dev") ;; *) echo "$dev: bound to $(drv_of "$dev"), skipped" ;; esac
+  done
+fi
+[ ${#DEVS[@]} -gt 0 ] || { echo "no GPU to resize"; exit 0; }
+
+RC=0
+for dev in "${DEVS[@]}"; do
+  [[ $dev == *:*:*.* ]] || dev="0000:$dev"
+  d=$SYS/$dev
+  [ -e "$d/resource2_resize" ] || { echo "$dev: no resource2_resize (no Resizable BAR for BAR2?)"; RC=1; continue; }
+  if [ "$(cat "$d/boot_vga" 2>/dev/null)" = 1 ]; then echo "$dev: boot VGA / console GPU, skipped"; continue; fi
+
+  mask=$(( 16#$(cat "$d/resource2_resize") ))
+  max=-1; for ((b = 0; b < 64; b++)); do (( (mask >> b) & 1 )) && max=$b; done
+  [ $max -ge 0 ] || { echo "$dev: no supported sizes reported"; RC=1; continue; }
+  if [ "$MAX_GIB" -gt 0 ]; then
+    while [ $max -gt 0 ] && { (( ((mask >> max) & 1) == 0 )) || [ $(( 1 << max )) -gt $(( MAX_GIB << 10 )) ]; }; do max=$((max - 1)); done
+  fi
+  read -r s e _ < <(sed -n 3p "$d/resource")
+  cur=$(( (e - s + 1) >> 20 ))
+  want=$(( 1 << max ))
+  echo "$dev: BAR2 $cur MiB -> $want MiB (size index $max)"
+  [ $cur -ge $want ] && { echo "$dev: already at that size"; continue; }
+  [ $DRY -eq 1 ] && continue
+
+  drv=$(drv_of "$dev")
+  [ -n "$drv" ] && echo "$dev" > "$d/driver/unbind"
+
+  removed=0
+  if [ $AUDIO -eq 1 ]; then
+    usp=$(dirname "$(dirname "$(readlink -f "$d")")")
+    for a in "$usp"/*/*; do
+      [ -f "$a/class" ] || continue
+      case "$(cat "$a/class")" in 0x0403*) echo "$dev: removing audio function ${a##*/}"; echo 1 > "$a/remove"; removed=1 ;; esac
+    done
+  fi
+
+  if echo "$max" > "$d/resource2_resize"; then
+    read -r s e _ < <(sed -n 3p "$d/resource")
+    echo "$dev: BAR2 now $(( (e - s + 1) >> 20 )) MiB"
+  else
+    echo "$dev: resize failed; see: dmesg | grep -iE 'was not released|BAR 2|ENOSPC' | tail"
+    [ $AUDIO -eq 0 ] && echo "$dev: if dmesg names the card's audio function, retry with --with-audio"
+    RC=1
+  fi
+
+  [ $removed -eq 1 ] && { echo 1 > /sys/bus/pci/rescan; sleep 2; }
+  if [ -n "$drv" ] && [ -z "$(drv_of "$dev")" ]; then
+    echo "$dev" > "/sys/bus/pci/drivers/$drv/bind" && echo "$dev: rebound to $drv"
+  fi
+done
+exit $RC

@@ -1,0 +1,15 @@
+[Unit]
+Description=Enlarge BAR2 of Intel Arc GPUs that share an upstream PCIe bridge
+# Run after udev has bound vfio-pci/xe, before any VM starts. The script
+# unbinds the GPUs itself; the rescan rebinds them to the same drivers.
+After=systemd-udev-settle.service systemd-modules-load.service
+Before=pve-guests.service
+ConditionKernelCommandLine=!nopcirebargroup
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pci-rebar-group --apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

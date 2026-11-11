@@ -1,0 +1,75 @@
+#!/bin/bash
+# rebar-window-check: does the 64-bit PCI window have room for full-size
+# BAR2 on every Intel Arc GPU?  Read-only.  Run as root.
+#
+# For each host bridge (root bus) that has Arc GPUs below it, it prints
+# the 64-bit windows above 4 GiB, the BAR2 size every GPU wants, and
+# whether the largest window can hold all of them with natural alignment
+# (a BAR of size N must start at a multiple of N).
+#
+# It ignores other devices already using the window, so "fits" is the
+# best case; the devices listed under "also in this window" need room too.
+#
+# Env for testing: IOMEM=<file> instead of /proc/iomem
+
+IOMEM=${IOMEM:-/proc/iomem}
+SYS=${SYS:-/sys/bus/pci/devices}
+[ "$(id -u)" -eq 0 ] || { echo "run as root (needed to read the ReBAR capability)"; exit 1; }
+
+human() { local b=$1; if (( b >= 1<<30 )); then echo "$(( b >> 30 )) GiB"; else echo "$(( b >> 20 )) MiB"; fi; }
+tobytes() { # "16GB" / "256MB" -> bytes
+  local v=${1%B}; case "$v" in *G) echo $(( ${v%G} << 30 ));; *M) echo $(( ${v%M} << 20 ));; *T) echo $(( ${v%T} << 40 ));; *) echo 0;; esac
+}
+
+declare -A NEED MAXA GPUS
+for d in "$SYS"/*; do
+  dev=${d##*/}
+  [ "$(cat "$d/vendor")" = 0x8086 ] || continue
+  case "$(cat "$d/class")" in 0x03*) ;; *) continue;; esac
+  line=$(lspci -vv -s "$dev" 2>/dev/null | grep -m1 "BAR 2: current size")
+  [ -n "$line" ] || { echo "$dev: no Resizable BAR entry for BAR2, skipped"; continue; }
+  cur=$(sed -E 's/.*current size: ([0-9]+[MGT]B).*/\1/' <<<"$line")
+  max=$(sed -E 's/.*supported: //; s/.* //' <<<"$line")
+  root=$(readlink -f "$d"); root=${root#*/devices/pci}; root=${root%%/*}   # e.g. 0000:80
+  b=$(tobytes "$max")
+  NEED[$root]=$(( ${NEED[$root]:-0} + b ))
+  (( b > ${MAXA[$root]:-0} )) && MAXA[$root]=$b
+  GPUS[$root]+=" $dev(${cur}->${max})"
+done
+
+[ ${#NEED[@]} -gt 0 ] || { echo "no Intel GPU with a resizable BAR2 found"; exit 0; }
+
+for root in "${!NEED[@]}"; do
+  echo "== host bridge PCI Bus $root"
+  echo "   GPUs: ${GPUS[$root]}"
+  echo "   wanted: $(human "${NEED[$root]}") in total, largest single BAR $(human "${MAXA[$root]}")"
+  best=0; bs=0; be=0
+  while IFS= read -r l; do
+    case "$l" in " "*) continue;; *" : PCI Bus $root") ;; *) continue;; esac
+    r=${l%% :*}; s=$(( 0x${r%-*} )); e=$(( 0x${r#*-} ))
+    (( s >= 1<<32 )) || continue
+    echo "   window: $r  ($(human $(( e - s + 1 ))))"
+    (( e - s + 1 > best )) && { best=$(( e - s + 1 )); bs=$s; be=$e; }
+  done < "$IOMEM"
+  if (( best == 0 )); then
+    echo "   RESULT: no 64-bit window above 4 GiB -> enable Above 4G decoding / 64-bit MMIO in the BIOS"
+    continue
+  fi
+  # place BARs largest first, each naturally aligned, back to back
+  sizes=$(for x in ${GPUS[$root]}; do x=${x##*->}; tobytes "${x%)}"; done | sort -rn)
+  pos=$bs; fit=1
+  for sz in $sizes; do
+    pos=$(( (pos + sz - 1) / sz * sz ))
+    (( pos + sz - 1 <= be )) || { fit=0; break; }
+    pos=$(( pos + sz ))
+  done
+  if (( fit )); then
+    echo "   RESULT: fits (best case, ignoring other devices in the window)"
+  else
+    echo "   RESULT: does NOT fit -> lower the size (rebar --max-gib) or move a GPU to another CPU's slots"
+  fi
+  # anything else already placed inside the chosen window
+  awk -v s="$bs" -v e="$be" -v root="$root" '
+    function hex(h,  i,c,v){v=0;h=tolower(h);for(i=1;i<=length(h);i++){c=index("0123456789abcdef",substr(h,i,1))-1;v=v*16+c}return v}
+    /^  [0-9a-f]/ { split($1,a,"-"); if (hex(a[1])>=s && hex(a[2])<=e) print "   also in this window: " $0 }' "$IOMEM" | sed 's/^   also in this window:  */   also in this window: /'
+done

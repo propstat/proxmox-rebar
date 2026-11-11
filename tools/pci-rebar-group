@@ -1,0 +1,238 @@
+#!/bin/bash
+# pci-rebar-group: enlarge BAR2 of Intel Arc GPUs that share an upstream
+# PCIe bridge, by resizing all of them in one re-enumeration.
+#
+# Why: the kernel resizes one device at a time and cannot grow a bridge
+# window that still holds another device's BAR. With several GPUs behind
+# one switch, each GPU pins the window for the others. Programming every
+# GPU's Resizable BAR control first and then re-enumerating the whole
+# subtree lets the allocator size the shared windows for all of them.
+#
+# Scope and safety:
+#  - groups GPUs by root port and only touches a root port whose subtree
+#    holds nothing but PCI bridges, Intel display devices and Intel audio;
+#    anything else (NIC, NVMe, HBA) below it -> the group is skipped
+#  - never touches the boot VGA / console GPU
+#  - preflight per host bridge: refuses when there is no 64-bit window
+#    above 4 GiB (Above 4G decoding off) or when the window cannot hold
+#    all enlarged BARs with their natural alignment
+#  - dry run unless --apply; rolls a group back to its old sizes if any GPU
+#    in it ends up without a BAR2
+#  - GPUs on their own root port are handled too, but on a kernel with the
+#    Arc BAR0 quirk the plain sysfs resource2_resize is simpler for those
+#
+# Needs: bash, setpci (pciutils), root, and pci=realloc on the cmdline.
+# Usage: pci-rebar-group [--apply] [--max-gib N]
+#        disable at boot with "nopcirebargroup" on the kernel cmdline
+
+set -u
+SYS=${SYS:-/sys/bus/pci/devices}
+IOMEM=${IOMEM:-/proc/iomem}
+APPLY=0
+MAX_GIB=0
+
+log() { echo "pci-rebar-group: $*"; echo "pci-rebar-group: $*" >/dev/kmsg 2>/dev/null || true; }
+die() { log "$*"; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --max-gib) shift; MAX_GIB=${1:-0} ;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+  shift
+done
+
+grep -qw nopcirebargroup /proc/cmdline && { log "disabled via kernel cmdline"; exit 0; }
+command -v setpci >/dev/null || die "setpci not found (install pciutils)"
+[ "$(id -u)" -eq 0 ] || die "must run as root"
+grep -q 'pci=realloc' /proc/cmdline || log "warning: pci=realloc not on the kernel cmdline; windows may not be resized on rescan"
+
+attr() { cat "$SYS/$1/$2" 2>/dev/null; }
+
+# Root port of a device: first PCI device in its sysfs path.
+root_port() {
+  local path rel
+  path=$(readlink -f "$SYS/$1") || return 1
+  rel=${path#*/devices/pci*/}
+  echo "${rel%%/*}"
+}
+
+# Echo "<entry offset> <supported mask> <ctrl dword>" for the ReBAR entry of BAR2.
+rebar_entry() {
+  local dev=$1 i ctrl cap n
+  ctrl=$(setpci -s "$dev" ECAP_REBAR+8.l 2>/dev/null) || return 1
+  n=$(( (0x$ctrl >> 5) & 7 ))
+  for ((i = 0; i < n; i++)); do
+    ctrl=$(setpci -s "$dev" ECAP_REBAR+$((8 + 8 * i)).l) || return 1
+    cap=$(setpci -s "$dev" ECAP_REBAR+$((4 + 8 * i)).l) || return 1
+    if [ $(( 0x$ctrl & 7 )) -eq 2 ]; then
+      echo "$((8 + 8 * i)) $(( 0x$cap >> 4 )) $ctrl"
+      return 0
+    fi
+  done
+  return 1
+}
+
+bar2_mib() {
+  local s e
+  read -r s e _ < <(sed -n 3p "$SYS/$1/resource" 2>/dev/null) || return 1
+  [ "$s" != 0x0000000000000000 ] || return 1
+  echo $(( (e - s + 1) >> 20 ))
+}
+
+# --- collect candidate GPUs, grouped by root port
+declare -A GROUP=() OFF=() ORIG=() TARGET=()
+for d in "$SYS"/*; do
+  dev=${d##*/}
+  [ "$(attr "$dev" vendor)" = 0x8086 ] || continue
+  case "$(attr "$dev" class)" in 0x03*) ;; *) continue ;; esac
+  if [ "$(attr "$dev" boot_vga)" = 1 ]; then log "$dev: boot VGA, skipped"; continue; fi
+  read -r off mask ctrl < <(rebar_entry "$dev") || continue
+  hi=-1
+  for ((b = 0; b < 28; b++)); do (( (mask >> b) & 1 )) && hi=$b; done
+  [ $hi -ge 0 ] || continue
+  if [ "$MAX_GIB" -gt 0 ]; then
+    while [ $hi -gt 0 ] && [ $(( 1 << hi )) -gt $(( MAX_GIB << 10 )) ]; do hi=$((hi - 1)); done
+  fi
+  cur=$(( (0x$ctrl >> 8) & 0x3f ))
+  rp=$(root_port "$dev") || continue
+  [ "$rp" != "$dev" ] || continue
+  if [ $cur -ge $hi ]; then log "$dev: BAR2 already at $(( 1 << cur )) MiB"; continue; fi
+  GROUP[$rp]="${GROUP[$rp]:-} $dev"
+  OFF[$dev]=$off; ORIG[$dev]=$ctrl; TARGET[$dev]=$hi
+done
+
+[ ${#GROUP[@]} -gt 0 ] || { log "nothing to do"; exit 0; }
+
+# --- safety: only bridges and Intel GPU/audio functions below the root port
+group_safe() {
+  local rp=$1 d q cls
+  for d in "$SYS"/*; do
+    q=$(readlink -f "$d")
+    case "$q" in */"$rp"/*) ;; *) continue ;; esac
+    cls=$(attr "${d##*/}" class)
+    case "$cls" in 0x0604*) continue ;; esac
+    [ "$(attr "${d##*/}" vendor)" = 0x8086 ] || { log "$rp: non-Intel device ${d##*/} below it"; return 1; }
+    case "$cls" in 0x03*|0x0403*) ;; *) log "$rp: unexpected device ${d##*/} class $cls below it"; return 1 ;; esac
+  done
+}
+
+write_sizes() { # $1 = target|orig
+  local dev v
+  for dev in $2; do
+    if [ "$1" = target ]; then
+      v=$(printf %08x $(( (0x${ORIG[$dev]} & ~0x3f00) | (TARGET[$dev] << 8) )))
+    else
+      v=${ORIG[$dev]}
+    fi
+    [ -e "$SYS/$dev" ] && setpci -s "$dev" ECAP_REBAR+${OFF[$dev]}.l="$v"
+  done
+}
+
+unbind_below() {
+  local rp=$1 d drv
+  for d in "$SYS"/*; do
+    case "$(readlink -f "$d")" in */"$rp"/*) ;; *) continue ;; esac
+    [ -L "$d/driver" ] || continue
+    drv=$(basename "$(readlink -f "$d/driver")")
+    [ "$drv" = pcieport ] && continue
+    echo "${d##*/}" > "$d/driver/unbind" && log "unbound $drv from ${d##*/}"
+  done
+}
+
+ACT=()
+for rp in "${!GROUP[@]}"; do
+  group_safe "$rp" || { log "$rp: skipped"; continue; }
+  for dev in ${GROUP[$rp]}; do
+    log "$rp: $dev BAR2 $(( 1 << ((0x${ORIG[$dev]} >> 8) & 0x3f) )) MiB -> $(( 1 << TARGET[$dev] )) MiB"
+  done
+  ACT+=("$rp")
+done
+[ ${#ACT[@]} -gt 0 ] || { log "no group passed the safety checks"; exit 0; }
+
+# --- preflight: 64-bit window present (Above 4G decoding) and large enough
+# Host bridge of a root port, e.g. 0000:80 for /sys/devices/pci0000:80/...
+host_bridge() { local p; p=$(readlink -f "$SYS/$1"); p=${p#*/devices/pci}; echo "${p%%/*}"; }
+
+# Largest window above 4 GiB of a host bridge: "<start> <end>", empty if none.
+# Only top-level /proc/iomem lines are host bridge windows.
+hb_window() {
+  local hb=$1 l r s e bs=0 be=0
+  while IFS= read -r l; do
+    case "$l" in " "*) continue ;; *" : PCI Bus $hb") ;; *) continue ;; esac
+    r=${l%% :*}; s=$(( 0x${r%-*} )); e=$(( 0x${r#*-} ))
+    (( s >= 1 << 32 )) || continue
+    (( e - s > be - bs )) && { bs=$s; be=$e; }
+  done < "$IOMEM"
+  (( be > 0 )) && echo "$bs $be"
+}
+
+# Place BARs (bytes) largest first, each naturally aligned, in [start, end].
+fits() {
+  local s=$1 e=$2 pos sz; shift 2
+  pos=$s
+  for sz in $(printf '%s\n' "$@" | sort -rn); do
+    pos=$(( (pos + sz - 1) / sz * sz ))
+    (( pos + sz - 1 <= e )) || return 1
+    pos=$(( pos + sz ))
+  done
+}
+
+declare -A HB_SIZES=()
+for rp in "${ACT[@]}"; do
+  hb=$(host_bridge "$rp")
+  for dev in ${GROUP[$rp]}; do HB_SIZES[$hb]+=" $(( 1 << (TARGET[$dev] + 20) ))"; done
+done
+declare -A HB_OK=()
+for hb in "${!HB_SIZES[@]}"; do
+  total=0; for sz in ${HB_SIZES[$hb]}; do total=$(( total + sz )); done
+  win=$(hb_window "$hb")
+  if [ -z "$win" ]; then
+    log "host bridge $hb: no 64-bit window above 4 GiB; enable Above 4G decoding (64-bit MMIO) in the BIOS"
+    continue
+  fi
+  read -r ws we <<<"$win"
+  if fits "$ws" "$we" ${HB_SIZES[$hb]}; then
+    log "host bridge $hb: window $(( (we - ws + 1) >> 30 )) GiB, needs $(( total >> 30 )) GiB aligned: fits (other devices in the window need room too)"
+    HB_OK[$hb]=1
+  else
+    log "host bridge $hb: window $(( (we - ws + 1) >> 30 )) GiB cannot hold $(( total >> 30 )) GiB of aligned BARs; use --max-gib or spread the GPUs over several CPUs"
+  fi
+done
+OK=()
+for rp in "${ACT[@]}"; do
+  if [ -n "${HB_OK[$(host_bridge "$rp")]:-}" ]; then OK+=("$rp"); else log "$rp: skipped by preflight"; fi
+done
+[ ${#OK[@]} -gt 0 ] && ACT=("${OK[@]}") || ACT=()
+[ ${#ACT[@]} -gt 0 ] || { log "no group passed the preflight"; exit 0; }
+[ $APPLY -eq 1 ] || { log "dry run; rerun with --apply"; exit 0; }
+
+# --- apply: program every GPU, remove each root port, rescan once
+for rp in "${ACT[@]}"; do
+  unbind_below "$rp"
+  write_sizes target "${GROUP[$rp]}"
+  echo 1 > "$SYS/$rp/remove"
+done
+sleep 2
+echo 1 > /sys/bus/pci/rescan
+sleep 3
+
+# --- verify, roll back failed groups
+RC=0
+for rp in "${ACT[@]}"; do
+  ok=1
+  for dev in ${GROUP[$rp]}; do
+    if m=$(bar2_mib "$dev"); then log "$dev: BAR2 now $m MiB"; else log "$dev: BAR2 unassigned"; ok=0; fi
+  done
+  [ $ok -eq 1 ] && continue
+  log "$rp: rolling back to the previous sizes (not enough MMIO space?)"
+  [ -e "$SYS/$rp" ] && { unbind_below "$rp"; write_sizes orig "${GROUP[$rp]}"; echo 1 > "$SYS/$rp/remove"; }
+  sleep 2; echo 1 > /sys/bus/pci/rescan; sleep 3
+  for dev in ${GROUP[$rp]}; do
+    m=$(bar2_mib "$dev") && log "$dev: BAR2 back at $m MiB" || log "$dev: BAR2 still unassigned, reboot with nopcirebargroup"
+  done
+  RC=1
+done
+exit $RC

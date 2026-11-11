@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          shellcheck -S warning install.sh \
+            tools/arc-vfio-resize tools/collect-arc-info \
+            tools/rebar-window-check tools/pci-rebar-group
+      - name: patches are well-formed
+        run: |
+          for p in patches/*.patch; do
+            grep -q '^From: ' "$p" || { echo "$p: no From: header"; exit 1; }
+            grep -q '^Signed-off-by: ' "$p" || echo "::warning file=$p::no Signed-off-by yet"
+            git apply --stat "$p" >/dev/null
+          done

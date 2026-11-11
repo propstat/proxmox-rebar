@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Fabian Thobe <fabian@thobe.eu>
+Date: Tue, 10 Nov 2026 08:02:13 +0100
+Subject: [PATCH 182/182] PCI: make releasing BAR0 of Intel Arc integrated
+ switches opt-in
+
+Upstream has not settled whether the switch keeps decoding the address
+range of the released BAR0. Until it has, only release it when booted
+with pci_arc_release_bar0, and log a hint otherwise. Without the
+parameter, the kernel behaves as before the quirk.
+---
+ Documentation/admin-guide/kernel-parameters.txt |  6 ++++++
+ drivers/pci/quirks.c                            | 16 ++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 03a55063064..3876b6bf197 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -5324,6 +5324,12 @@ Kernel parameters
+ 				to disable PCIe TLP Processing Hints support
+ 				system-wide.
+ 
++	pci_arc_release_bar0[=<bool>]
++			[PCI] Release BAR0 of the PCIe switch integrated into
++			Intel Arc GPUs, so the BAR2 of the GPU can be resized to
++			cover its full VRAM even if the firmware does not
++			enable Resizable BAR. Off by default.
++
+ 	pcie_aspm=	[PCIE] Forcibly enable or ignore PCIe Active State Power
+ 			Management.
+ 		off	Don't touch ASPM configuration at all.  Leave any
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index a147cb55fb0..4cec5cf11a2 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -6390,6 +6390,17 @@ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_GLI, 0x9755, pci_mask_replay_timer_timeout
+  * Release and disable BAR0 permanently by clearing its flags to prevent
+  * anything from assigning it again.
+  */
++static bool pci_arc_release_bar0_enabled __ro_after_init;
++
++static int __init pci_arc_release_bar0_setup(char *str)
++{
++	if (!str)
++		str = "1";
++
++	return kstrtobool(str, &pci_arc_release_bar0_enabled);
++}
++early_param("pci_arc_release_bar0", pci_arc_release_bar0_setup);
++
+ static void pci_release_bar0(struct pci_dev *pdev)
+ {
+ 	struct resource *res = pci_resource_n(pdev, 0);
+@@ -6397,6 +6408,11 @@ static void pci_release_bar0(struct pci_dev *pdev)
+ 	if (!res->parent)
+ 		return;
+ 
++	if (!pci_arc_release_bar0_enabled) {
++		pci_info(pdev, "BAR 0 may prevent resizing the GPU BAR; boot with pci_arc_release_bar0 to release it\n");
++		return;
++	}
++
+ 	if (pci_release_resource(pdev, 0))
+ 		return;
+ 

@@ -1,0 +1,13 @@
+[Unit]
+Description=Enlarge BAR2 of Intel Arc GPUs bound to vfio-pci
+After=systemd-udev-settle.service systemd-modules-load.service
+Before=pve-guests.service
+ConditionKernelCommandLine=pci_arc_release_bar0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/arc-vfio-resize
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

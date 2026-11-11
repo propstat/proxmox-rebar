@@ -1,0 +1,44 @@
+#!/bin/bash
+# collect-arc-info: snapshot of everything needed to judge the Arc ReBAR
+# test, one directory + tarball per test phase. Read-only. Run as root.
+#
+# Usage: collect-arc-info <label>      e.g. baseline, no-param, param, vm
+
+set -u
+LABEL=${1:?usage: collect-arc-info <label>}
+[ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
+OUT="arc-test-$LABEL-$(date +%Y%m%d-%H%M)"
+mkdir -p "$OUT"
+
+run() { local f=$1; shift; { echo "# $*"; "$@" 2>&1; } > "$OUT/$f"; }
+
+run uname.txt        uname -a
+run cmdline.txt      cat /proc/cmdline
+run lspci-nn.txt     lspci -nn
+run lspci-tree.txt   lspci -tv
+run iomem.txt        cat /proc/iomem
+run dmesg-pci.txt    sh -c "dmesg | grep -iE 'BAR [0-9]|rebar|resiz|pci_arc_release_bar0|was not released|bridge window|ENOSPC|xe |i915|vfio' "
+
+# Intel display + audio functions and the bridges above them
+: > "$OUT/lspci-vv-arc.txt"
+: > "$OUT/resize-masks.txt"
+for d in /sys/bus/pci/devices/*; do
+  [ "$(cat "$d/vendor")" = 0x8086 ] || continue
+  case "$(cat "$d/class")" in 0x03*|0x0403*) ;; *) continue ;; esac
+  dev=${d##*/}
+  path=$(readlink -f "$d")
+  for p in $(echo "${path#*/devices/pci*/}" | tr / ' '); do
+    lspci -vv -nn -s "$p" >> "$OUT/lspci-vv-arc.txt" 2>&1
+  done
+  drv=$( [ -L "$d/driver" ] && basename "$(readlink -f "$d/driver")" || echo none )
+  mask=$(cat "$d/resource2_resize" 2>/dev/null || echo n/a)
+  echo "$dev class=$(cat "$d/class") driver=$drv boot_vga=$(cat "$d/boot_vga" 2>/dev/null || echo -) resource2_resize=$mask" >> "$OUT/resize-masks.txt"
+done
+
+command -v rebar-window-check >/dev/null && run window-check.txt rebar-window-check
+
+tar czf "$OUT.tar.gz" "$OUT"
+echo "saved $OUT/ and $OUT.tar.gz"
+echo "--- summary"
+cat "$OUT/resize-masks.txt"
+grep -E "Region 2|BAR 2: current" "$OUT/lspci-vv-arc.txt" | sort -u

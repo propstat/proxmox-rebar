@@ -44,21 +44,32 @@ VFIO_AUTO=0 TOOLS=1 UNINSTALL=0 FORCE=0 YES=0
 # ==============================================================================
 
 # CI COLORS
-PS_DARK_BLUE=$(printf '\033[38;2;0;40;85m')       # shellcheck disable=SC2034 #002855
-PS_LIGHT_BLUE=$(printf '\033[38;2;94;147;219m')   # shellcheck disable=SC2034 #5E93DB
-PS_GREY=$(printf '\033[38;2;63;68;68m')           # shellcheck disable=SC2034 #3F4444
-PS_SKY_BLUE=$(printf '\033[38;2;221;229;237m')    # shellcheck disable=SC2034 #DDE5ED
+# shellcheck disable=SC2034 
+PS_DARK_BLUE=$(printf '\033[38;2;0;40;85m')       #002855
+# shellcheck disable=SC2034 
+PS_LIGHT_BLUE=$(printf '\033[38;2;94;147;219m')   #5E93DB
+# shellcheck disable=SC2034 
+PS_GREY=$(printf '\033[38;2;63;68;68m')           #3F4444
+# shellcheck disable=SC2034 
+PS_SKY_BLUE=$(printf '\033[38;2;221;229;237m')    #DDE5ED
 
 # INTERFACE COLORS
-PS_RED=$(printf '\033[38;2;218;41;28m')            # shellcheck disable=SC2034 #DA291C
-PS_ORANGE=$(printf '\033[38;2;253;170;99m')        # shellcheck disable=SC2034 #FDAA63
-PS_YELLOW=$(printf '\033[38;2;250;224;83m')        # shellcheck disable=SC2034 #FAE053
-PS_GREEN=$(printf '\033[38;2;92;170;127m')         # shellcheck disable=SC2034 #5CAA7F
+# shellcheck disable=SC2034 
+PS_RED=$(printf '\033[38;2;218;41;28m')            #DA291C
+# shellcheck disable=SC2034 
+PS_ORANGE=$(printf '\033[38;2;253;170;99m')        #FDAA63
+# shellcheck disable=SC2034 
+PS_YELLOW=$(printf '\033[38;2;250;224;83m')        #FAE053
+# shellcheck disable=SC2034 
+PS_GREEN=$(printf '\033[38;2;92;170;127m')         #5CAA7F
 
 # TERMINAL FORMATTING
-PS_BOLD=$(printf '\033[1m') # shellcheck disable=SC2034 
-PS_DIM=$(printf '\033[2m')  # shellcheck disable=SC2034 
-NC=$(printf '\033[0m')      # shellcheck disable=SC2034 
+# shellcheck disable=SC2034 
+PS_BOLD=$(printf '\033[1m')
+# shellcheck disable=SC2034 
+PS_DIM=$(printf '\033[2m')
+# shellcheck disable=SC2034 
+NC=$(printf '\033[0m')
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }

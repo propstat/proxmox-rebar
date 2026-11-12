@@ -1,23 +1,97 @@
 name: ci
 
+# What this checks:
+#   shellcheck  the install script and the tools
+#   kernel      that the patches apply to the real Proxmox kernel source,
+#               using pve-kernel's own Makefile step that applies all of
+#               Proxmox's patches plus ours, and that the changed PCI code
+#               compiles with the Proxmox/Ubuntu kernel config.
+#               Runs against the pve-kernel commit install.sh builds by
+#               default, and against pve-kernel master (weekly too), so a
+#               new Proxmox kernel that breaks the patches shows up here.
+# What it can't check: whether the fix works. That needs Arc hardware.
+
 on:
   push:
   pull_request:
+  schedule:
+    - cron: '23 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
+  shellcheck:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: shellcheck
-        run: |
+      - uses: actions/checkout@v6
+      - run: |
           shellcheck -S warning install.sh \
             tools/arc-vfio-resize tools/collect-arc-info \
             tools/rebar-window-check tools/pci-rebar-group
-      - name: patches are well-formed
+
+  kernel:
+    name: patches on pve-kernel ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [tested, master]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: proxmox-rebar
+
+      - name: free disk space
         run: |
-          for p in patches/*.patch; do
-            grep -q '^From: ' "$p" || { echo "$p: no From: header"; exit 1; }
-            grep -q '^Signed-off-by: ' "$p" || echo "::warning file=$p::no Signed-off-by yet"
-            git apply --stat "$p" >/dev/null
-          done
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: install build tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            bc bison dpkg-dev flex libelf-dev libssl-dev patch python3
+
+      - name: clone pve-kernel
+        run: |
+          git clone -q https://git.proxmox.com/git/pve-kernel.git
+          if [ "${{ matrix.target }}" = tested ]; then
+            ref=$(sed -n 's/^PVE_KERNEL_REF=//p' proxmox-rebar/install.sh)
+          else
+            ref=origin/master
+          fi
+          git -C pve-kernel checkout -q --detach "$ref"
+          git -C pve-kernel log -1 --format='pve-kernel %h %s'
+          head -1 pve-kernel/debian/changelog
+
+      - name: fetch the kernel and ZFS sources
+        working-directory: pve-kernel
+        run: |
+          git submodule update --init --depth 1 submodules/ubuntu-kernel ||
+            git submodule update --init --filter=blob:none submodules/ubuntu-kernel
+          git submodule update --init --recursive --depth 1 submodules/zfsonlinux ||
+            git submodule update --init --recursive submodules/zfsonlinux
+          df -h /
+
+      - name: apply Proxmox's patches and ours (pve-kernel Makefile)
+        working-directory: pve-kernel
+        run: |
+          cp ../proxmox-rebar/patches/9*.patch patches/kernel/
+          make ubuntu-kernel.prepared </dev/null
+          src=$(find "$PWD" -maxdepth 2 -type d -path '*/proxmox-kernel-*/ubuntu-kernel')
+          grep -q pci_arc_release_bar0 "$src/drivers/pci/quirks.c"
+          grep -q 'pci_upstream_bridge(pdev)' "$src/drivers/pci/setup-bus.c"
+          echo "KSRC=$src" >> "$GITHUB_ENV"
+
+      - name: compile the changed PCI code with the Proxmox config
+        working-directory: ${{ env.KSRC }}
+        run: |
+          make olddefconfig
+          make -j"$(nproc)" drivers/pci/quirks.o drivers/pci/setup-bus.o
+
+      - name: checkpatch on the patch from this repository
+        run: |
+          "$KSRC/scripts/checkpatch.pl" --no-tree proxmox-rebar/patches/9182-*.patch
